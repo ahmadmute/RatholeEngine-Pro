@@ -1,0 +1,24 @@
+# فایل آمادهٔ Git (پیشنهادی)
+# 1) آرشیو RatholeEngine-Pro-v1.5.1-git-ready.tar.gz را استخراج کن.
+cd RatholeEngine-Pro
+git remote -v
+git push -u origin main
+git push origin v1.5.1
+
+# روش جایگزین با Git Bundle
+git clone RatholeEngine-Pro-v1.5.1.git.bundle RatholeEngine-Pro
+cd RatholeEngine-Pro
+git remote add origin https://github.com/ahmadmute/RatholeEngine-Pro.git
+git push -u origin main
+git push origin v1.5.1
+
+# فقط در صورت استفاده از source.zip که تاریخچه Git ندارد
+git init -b main
+git config user.name "Your Name"
+git config user.email "you@example.com"
+git add -A
+git commit -m "release: prepare RatholeEngine Pro v1.5.1"
+git remote add origin https://github.com/ahmadmute/RatholeEngine-Pro.git
+git push -u origin main
+git tag -a v1.5.1 -m "RatholeEngine Pro v1.5.1"
+git push origin v1.5.1

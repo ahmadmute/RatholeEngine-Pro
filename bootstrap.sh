@@ -1,0 +1,428 @@
+#!/usr/bin/env bash
+# bootstrap.sh — amade-sazi mhit, thih baste (mahalli ya download), baz kardan va ejra-ye nasab
+#
+# agar baste (rathole-manager.zip / .tar.gz) knar askript ya dar masir jari bashd, download nemishavad.
+# agar etelaat kafi ndhi, bhsvrt taamoli miporsad.
+#
+# nemoonehaye gheyre-taamoli:
+#   sudo bash bootstrap.sh --panel --domain panel.example.ir \
+#        --fullchain /root/cert/panel.example.ir/fullchain.pem --key /root/cert/panel.example.ir/privkey.pem
+#   sudo bash bootstrap.sh --node -- --server panel.example.ir:443 --name trk01 --token <T> --inbound-port 2087
+#   sudo bash bootstrap.sh --url https://host/rathole-manager.zip --panel ...
+#   sudo bash bootstrap.sh --local ./rathole-manager.zip --no-run
+#   sudo bash bootstrap.sh --local ./rathole-manager.zip --update   # update kamel (khodkar panel/node/hub)
+#   sudo bash bootstrap.sh --uninstall            # hazf kamel (panel/node/hub) ba taid
+#   sudo bash bootstrap.sh --purge --yes          # hazf kamel + binary rathole/config hub، bedoon porsesh
+#
+# taamoli: fght `sudo bash bootstrap.sh` va baghie ra miporsad (menu shamel gozine update ham hast).
+
+set -euo pipefail
+
+BUNDLE_URL="${BUNDLE_URL:-}"
+LOCAL=""
+INSTALL_DIR="${INSTALL_DIR:-/opt/rathole-manager}"
+MODE=""
+RUN=1
+ASSUME_YES=0
+ROLLBACK_TS=""
+PURGE=0
+PASS_ARGS=()
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo "$PWD")"
+
+c_g(){ printf '\033[1;32m%s\033[0m' "$*"; }
+c_r(){ printf '\033[1;31m%s\033[0m' "$*"; }
+c_y(){ printf '\033[1;33m%s\033[0m' "$*"; }
+log(){ printf '%s %s\n' "$(c_g '[+]')" "$*"; }
+warn(){ printf '%s %s\n' "$(c_y '[*]')" "$*"; }
+err(){ printf '%s %s\n' "$(c_r '[!]')" "$*" >&2; }
+die(){ err "$*"; exit 1; }
+# zir-e `curl ... | sudo bash` stdin pipe ast na terminal؛ agar /dev/tty baz shavad
+# hanooz mitavanim taamoli beporsim (rdp/ask_yn az /dev/tty mikhanand).
+TTY_DEV=""
+if [ ! -t 0 ] && { : < /dev/tty; } 2>/dev/null; then TTY_DEV="/dev/tty"; fi
+is_tty(){ [ -t 0 ] || [ -n "$TTY_DEV" ]; }
+rdp(){ # read -rp ke ba stdin-e pipe ham kar mikonad: $1=prompt $2=nam-e motghayer
+  if [ -n "$TTY_DEV" ]; then IFS= read -rp "$1" "$2" < "$TTY_DEV"; else IFS= read -rp "$1" "$2"; fi
+}
+ask_yn(){ [ "$ASSUME_YES" -eq 1 ] && return 0; local a; rdp "$1 [Y/n]: " a; [[ -z "$a" || "$a" =~ ^[Yy]$ ]]; }
+
+# ---------- pars argvmanha ----------
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --url)     BUNDLE_URL="$2"; shift 2;;
+    --local)   LOCAL="$2"; shift 2;;
+    --dir)     INSTALL_DIR="$2"; shift 2;;
+    --panel)   MODE="panel"; shift;;
+    --node)    MODE="node"; shift;;
+    --update)  MODE="update"; shift;;
+    --rollback) MODE="rollback"; shift
+                if [ $# -gt 0 ] && [ "${1#--}" = "$1" ]; then ROLLBACK_TS="$1"; shift; fi ;;
+    --list-backups) MODE="listbackups"; shift;;
+    --uninstall|--remove) MODE="uninstall"; shift;;
+    --purge)   MODE="uninstall"; PURGE=1; shift;;
+    --no-run)  RUN=0; shift;;
+
+    --yes|-y)  ASSUME_YES=1; shift;;
+    --)        shift; PASS_ARGS+=("$@"); break;;
+    *)         PASS_ARGS+=("$1"); shift;;
+  esac
+done
+
+[ "$(id -u)" -eq 0 ] || die "bayad ba root ejra shavad (sudo)."
+
+# ---------- nasb pishniazhai paih ----------
+install_prereqs(){
+  local pkgs="curl unzip tar ca-certificates"
+  log "amade-sazi mohit va nasb pish-niazha ($pkgs)..."
+  if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive; apt-get update -y && apt-get install -y $pkgs
+  elif command -v dnf >/dev/null 2>&1; then dnf install -y $pkgs
+  elif command -v yum >/dev/null 2>&1; then yum install -y $pkgs
+  elif command -v pacman >/dev/null 2>&1; then pacman -Sy --noconfirm curl unzip tar ca-certificates
+  elif command -v apk >/dev/null 2>&1; then apk add --no-cache curl unzip tar ca-certificates bash
+  else warn "pkijmnijr shnakhth nshd; motmaen shv curl/unzip/tar nasb-and."; fi
+}
+
+# ---------- peyda kardan baste-ye mahalli ----------
+find_local_bundle(){
+  local d f
+  for d in "$SCRIPT_DIR" "$PWD"; do
+    for f in rathole-manager.zip rathole-manager.tar.gz rathole-manager.tgz; do
+      [ -f "$d/$f" ] && { echo "$d/$f"; return 0; }
+    done
+  done
+  return 1
+}
+
+# ---------- peyda kardan update.sh-e mahalli (baraye rollback/list-backups bedoon download) ----------
+find_update_sh(){
+  local c
+  for c in "$INSTALL_DIR/update.sh" "$SCRIPT_DIR/rathole-manager/update.sh" "$SCRIPT_DIR/update.sh"; do
+    [ -f "$c" ] && { echo "$c"; return 0; }
+  done
+  return 1
+}
+
+# ---------- ejra-ye rollback/list-backups az tarigh-e update.sh ----------
+exec_update_action(){ # $1 = masir update.sh
+  local u="$1"
+  case "$MODE" in
+    listbackups) exec bash "$u" --list-backups ;;
+    rollback)    if [ -n "$ROLLBACK_TS" ]; then exec bash "$u" --rollback "$ROLLBACK_TS"; else exec bash "$u" --rollback; fi ;;
+  esac
+}
+
+# ---------- tashkhis mnba baste (mahalli ya download) ----------
+SRC_FILE=""   # agar pr shvd, iani file mahalli darim va download lazem nist
+resolve_source(){
+  # 1) --local sarih
+  if [ -n "$LOCAL" ]; then
+    [ -f "$LOCAL" ] || die "file mahalli peyda nashod: $LOCAL"
+    SRC_FILE="$LOCAL"; return
+  fi
+  # 2) --url ke dar vaghe masir/file mahalli ast
+  if [ -n "$BUNDLE_URL" ]; then
+    case "$BUNDLE_URL" in
+      file://*) local f="${BUNDLE_URL#file://}"; [ -f "$f" ] && SRC_FILE="$f" ;;
+      /*|./*|../*) [ -f "$BUNDLE_URL" ] && SRC_FILE="$BUNDLE_URL" ;;
+    esac
+    return   # agar SRC_FILE khali mand, iani URL rah dvr ast → download
+  fi
+  # 3) jostojoo-ye khodkar baste-ye mahalli
+  local lb
+  if lb="$(find_local_bundle)"; then
+    log "baste-ye mahalli peyda shod: $(c_y "$lb")"
+    if ask_yn "az hamin estefade shavad (bedoon download)?"; then SRC_FILE="$lb"; return; fi
+  fi
+  # 4) chizi nadarim → agar taamoli ast bprs, vagarna khata
+  if is_tty; then
+    local ans; rdp "link baste (URL) ya masir file mahalli: " ans
+    [ -n "$ans" ] || die "mnba baste dade nashod."
+    if [ -f "$ans" ]; then SRC_FILE="$ans"; else BUNDLE_URL="$ans"; fi
+  else
+    die "baste-i peyda nashod va --url/--local ham dade nashode."
+  fi
+}
+
+# ---------- download ----------
+download(){
+  local url="$1" out="$2"
+  log "download baste az: $url"
+  if command -v curl >/dev/null 2>&1; then curl -fSL --retry 3 --connect-timeout 20 "$url" -o "$out"
+  elif command -v wget >/dev/null 2>&1; then wget -O "$out" "$url"
+  else return 1; fi
+}
+
+# ---------- baz kardan ----------
+validate_archive_paths(){
+  # Bootstrap ba root ejra mishavad; ghabl az extract path traversal/absolute path ra rad mikonim.
+  local file="$1" kind="$2" entry norm part
+  local listing=""
+  case "$kind" in
+    zip) listing="$(unzip -Z1 "$file")" || return 1 ;;
+    tgz) listing="$(tar -tzf "$file")" || return 1 ;;
+    tar) listing="$(tar -tf "$file")" || return 1 ;;
+    *) return 1 ;;
+  esac
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    norm="$(printf '%s' "$entry" | tr '\\' '/')"
+    case "$norm" in /*|[A-Za-z]:/*) return 1 ;; esac
+    IFS='/' read -r -a _parts <<< "$norm"
+    for part in "${_parts[@]}"; do [ "$part" = ".." ] && return 1; done
+  done <<< "$listing"
+  return 0
+}
+
+extract(){
+  local file="$1" dest="$2" kind=""; mkdir -p "$dest"
+  case "$file" in
+    *.zip) kind=zip ;;
+    *.tar.gz|*.tgz) kind=tgz ;;
+    *.tar) kind=tar ;;
+    *) if head -c 2 "$file" | grep -q "PK"; then kind=zip; else kind=tgz; fi ;;
+  esac
+  [ "$kind" != zip ] || command -v unzip >/dev/null 2>&1 || die "unzip nasb nist."
+  validate_archive_paths "$file" "$kind" || die "baste path-e khatarnaak ya list-e namotabar darad; extract lghv shod."
+  case "$kind" in
+    zip) unzip -o "$file" -d "$dest" >/dev/null; fix_backslash_names "$dest" ;;
+    tgz) tar -xzf "$file" -C "$dest" ;;
+    tar) tar -xf "$file" -C "$dest" ;;
+  esac
+  # Bundle-e rasmi faqat file/directory darad. Symlink/device/FIFO dar installer-e root ghabool nist.
+  if find "$dest" -mindepth 1 ! -type f ! -type d -print -quit | grep -q .; then
+    die "baste shamel symlink ya file-e khas ast; extract lghv shod."
+  fi
+}
+
+# aslah namhaii ke ba backslash zkhirh shdhand (zip sakhthshdh ba Windows Compress-Archive)
+fix_backslash_names(){
+  local dest="$1" f rel fixed
+  while IFS= read -r -d '' f; do
+    rel="${f#"$dest"/}"
+    fixed="${rel//\\//}"
+    [ "$rel" = "$fixed" ] && continue
+    mkdir -p "$dest/$(dirname "$fixed")"
+    mv -f "$f" "$dest/$fixed"
+  done < <(find "$dest" -maxdepth 1 -type f -name '*\\*' -print0 2>/dev/null)
+}
+
+find_root(){
+  local base="$1" f
+  f="$(find "$base" -maxdepth 3 -name 'install-panel.sh' -print -quit 2>/dev/null)"
+  [ -n "$f" ] && { dirname "$f"; return 0; }
+  return 1
+}
+
+# ---------- tashkhis nasb-e mojood (baraye update-e khodkar) ----------
+detect_installed(){ # rc=0 agar panel/node/hub ghablan nasb shode bashad
+  [ -d /etc/rathole-manager ] || [ -f /etc/systemd/system/rathole-server.service ] || \
+  [ -f /etc/rathole/node.env ] || [ -f /etc/systemd/system/rathole-client.service ] || \
+  [ -f /opt/ratholehub/hub.py ] || [ -f /etc/systemd/system/ratholehub.service ]
+}
+installed_roles(){ # esm-e naghsh-haye nasb-shode baraye namayesh
+  local r=()
+  { [ -d /etc/rathole-manager ] || [ -f /etc/systemd/system/rathole-server.service ]; } && r+=(panel)
+  { [ -f /etc/rathole/node.env ] || [ -f /etc/systemd/system/rathole-client.service ]; } && r+=(node)
+  { [ -f /opt/ratholehub/hub.py ] || [ -f /etc/systemd/system/ratholehub.service ]; } && r+=(hub)
+  echo "${r[*]:-}"
+}
+
+# ---------- hazf kamel (uninstall) ----------
+# har naghsh-e nasb-shode ra ba uninstaller-e khodesh hazf mikonad (panel/node),
+# va hub ra inja mostaghim (chون uninstaller-e joda nadarad). --purge/-y forward mishavad.
+uninstall_hub(){
+  log "hazf hub (ratholehub)..."
+  systemctl disable --now ratholehub 2>/dev/null || true
+  rm -f /etc/systemd/system/ratholehub.service
+  systemctl daemon-reload 2>/dev/null || true
+  rm -rf /opt/ratholehub
+  if [ "$PURGE" -eq 1 ]; then
+    warn "purge: pooshe-ye config-e hub (/etc/ratholehub — shamel token/ramz) ham hazf mishavad."
+    rm -rf /etc/ratholehub
+  else
+    warn "config-e hub (/etc/ratholehub) baghi mand (baraye hazf-e kamel: --purge)."
+  fi
+  # location-e /hub/ dar nginx (agar ratholectl hub on sakhte bood)
+  command -v ratholectl >/dev/null 2>&1 && ratholectl hub off 2>/dev/null || true
+  log "hub hazf shod."
+}
+
+run_uninstall(){
+  local dir="$1" roles f rc=0
+  roles="$(installed_roles)"
+  if [ -z "$roles" ]; then
+    warn "hich nasb-e rathole-ei (panel/node/hub) peyda nashod؛ chizi baraye hazf nist."
+    exit 0
+  fi
+  echo; warn "$(c_r 'HAZF-E KAMEL') — naghsh-haye nasb-shode: $(c_y "$roles")"
+  warn "in kar service-ha، config-ha va state ra hazf mikonad. (gvahi/TLS dast nemikhorad.)"
+  [ "$PURGE" -eq 1 ] && warn "purge faal ast: binary-e rathole va config-e hub ham hazf mishavand."
+  ask_yn "motmaen hasti hazf shavad?" || { log "lghv shod."; exit 0; }
+
+  local flags=(--yes); [ "$PURGE" -eq 1 ] && flags+=(--purge)
+
+  case " $roles " in *" panel "*)
+    f="$dir/uninstall-panel.sh"
+    [ -f "$f" ] || f="$(find "$dir" -maxdepth 3 -name 'uninstall-panel.sh' -print -quit 2>/dev/null)"
+    if [ -n "$f" ] && [ -f "$f" ]; then log "ejra-ye uninstall-panel.sh..."; bash "$f" "${flags[@]}" || rc=1
+    else err "uninstall-panel.sh peyda nashod."; rc=1; fi ;;
+  esac
+  case " $roles " in *" node "*)
+    f="$dir/uninstall-node.sh"
+    [ -f "$f" ] || f="$(find "$dir" -maxdepth 3 -name 'uninstall-node.sh' -print -quit 2>/dev/null)"
+    if [ -n "$f" ] && [ -f "$f" ]; then log "ejra-ye uninstall-node.sh..."; bash "$f" "${flags[@]}" || rc=1
+    else err "uninstall-node.sh peyda nashod."; rc=1; fi ;;
+  esac
+  case " $roles " in *" hub "*) uninstall_hub || rc=1 ;; esac
+
+  echo
+  if [ "$rc" -eq 0 ]; then log "hazf-e kamel anjam shod."
+  else err "hazf ba chand khata tamam shod؛ balaha ra barresi kon."; fi
+  exit "$rc"
+}
+
+# ---------- entekhab halat va grftn etelaat (taamoli) ----------
+choose_mode(){
+  echo; echo "$(c_g 'halat nasb ra entekhab kon:')"
+  echo "  1) panel (server Iran)"
+  echo "  2) node (server kharej)"
+  echo "  3) update (beroozresani kamel ba snapshot + rollback-e khodkar)"
+  echo "  4) fght amade-sazi (bedoon ejra-ye nasab)"
+  echo "  5) rollback (bazgasht be akharin snapshot-e ghabl az update)"
+  echo "  6) list-e backup-ha (snapshot-haye mojood)"
+  echo "  7) $(c_r 'hazf kamel') (uninstall — panel/node/hub + config/state)"
+  local m def=""
+  if detect_installed; then
+    def="3"
+    echo; warn "nasb-e mojood tashkhis dade shod: $(c_y "$(installed_roles)") → pishfarz: update"
+  fi
+  rdp "entekhab [1/2/3/4/5/6/7]${def:+ (pishfarz: $def)}: " m
+  m="${m:-$def}"
+  case "$m" in
+    1) MODE="panel" ;;
+    2) MODE="node" ;;
+    3) MODE="update" ;;
+    4) RUN=0 ;;
+    5) MODE="rollback" ;;
+    6) MODE="listbackups" ;;
+    7) MODE="uninstall" ;;
+    *) die "entekhab namotabar." ;;
+  esac
+}
+
+
+prompt_node_args(){
+  echo; log "etelaat node ra vared kon (az khorooji 'ratholectl add' rooye panel):"
+  local server name token inbound atoken aib
+  rdp "adres server Iran (masalan panel.example.ir:443): " server
+  rdp "name node (masalan trk01): " name
+  rdp "token service: " token
+  rdp "port inbound Xray rooye node [2087]: " inbound; inbound="${inbound:-2087}"
+  rdp "token API (akhtiari, khali=rad): " atoken
+  PASS_ARGS=(--server "$server" --name "$name" --token "$token" --inbound-port "$inbound")
+  if [ -n "$atoken" ]; then
+    rdp "port inbound API node [62050]: " aib; aib="${aib:-62050}"
+    PASS_ARGS+=(--api-token "$atoken" --api-inbound-port "$aib")
+  fi
+}
+
+main(){
+  # rollback/list-backups: agar update.sh-e mahalli hast, bedoon download ejra kon
+  if [ "$MODE" = "rollback" ] || [ "$MODE" = "listbackups" ]; then
+    local u; if u="$(find_update_sh)"; then exec_update_action "$u"; fi
+    warn "update.sh-e mahalli peyda nashod؛ baste ra amade mikonam..."
+  fi
+
+  # uninstall: uninstaller-ha maamoolan az nasb-e ghabli mojood-and → bedoon download hazf kon.
+  # agar peyda nashodand (masalan nasb-e nimeh-kareh)، be amade-sazi-ye baste edame midahim.
+  if [ "$MODE" = "uninstall" ]; then
+    local d
+    for d in "$INSTALL_DIR" "$SCRIPT_DIR" "$SCRIPT_DIR/rathole-manager"; do
+      if [ -f "$d/uninstall-panel.sh" ] || [ -f "$d/uninstall-node.sh" ]; then
+        run_uninstall "$d"   # exit mikonad
+      fi
+    done
+    warn "uninstaller-e mahalli peyda nashod؛ baste ra amade mikonam..."
+  fi
+
+  install_prereqs
+  resolve_source
+
+  local tmp; tmp="$(mktemp -d)"
+  local bundle
+  local pickname="${SRC_FILE:-$BUNDLE_URL}"
+  case "$pickname" in
+    *.tar.gz|*.tgz) bundle="$tmp/bundle.tar.gz" ;;
+    *.tar)          bundle="$tmp/bundle.tar" ;;
+    *)              bundle="$tmp/bundle.zip" ;;
+  esac
+
+  if [ -n "$SRC_FILE" ]; then
+    log "estefade az baste-ye mahalli (bedoon download): $SRC_FILE"
+    cp "$SRC_FILE" "$bundle"
+  else
+    download "$BUNDLE_URL" "$bundle" || die "download shekast khord (link/shbkh/filtr ra barresi kon)."
+  fi
+  log "hajm baste: $(du -h "$bundle" | cut -f1)"
+
+  log "baz kardan baste..."
+  extract "$bundle" "$tmp/x"
+  local src; src="$(find_root "$tmp/x")" || die "askripthai nasb dar baste peyda nshdnd."
+  log "mohtava-ye baste dar: $src"
+
+  log "copy be $INSTALL_DIR ..."
+  mkdir -p "$INSTALL_DIR"; cp -rf "$src/." "$INSTALL_DIR/"
+
+  log "normal-sazi khate-payan va mojavez ejra..."
+  local s
+  for s in "$INSTALL_DIR"/*.sh "$INSTALL_DIR/ratholectl" "$INSTALL_DIR/ratholenode"; do
+    [ -f "$s" ] || continue; sed -i 's/\r$//' "$s"; chmod +x "$s"
+  done
+  rm -rf "$tmp"
+  log "baste amade shod dar: $INSTALL_DIR"
+
+  # entekhab halat agar moshakhas nashode
+  if [ -z "$MODE" ] && [ "$RUN" -eq 1 ]; then
+    if is_tty; then choose_mode
+    elif detect_installed; then
+      # bedoon terminal (masalan curl | bash az cron/hub): nasb-e mojood → update-e khodkar
+      warn "nasb-e mojood tashkhis dade shod ($(installed_roles)) va terminal nist → update-e khodkar."
+      MODE="update"
+    else RUN=0; fi
+  fi
+
+  if [ "$RUN" -eq 0 ] || [ -z "$MODE" ]; then
+    echo; log "amade-sazi kamel shod (bedoon ejra-ye nasab)."
+    echo "  panel:  $(c_y "sudo bash $INSTALL_DIR/install-panel.sh --domain <d> --fullchain <fc> --key <key>")"
+    echo "  node:  $(c_y "sudo bash $INSTALL_DIR/install-node.sh --server <d>:443 --name <n> --token <t> --inbound-port <p>")"
+    exit 0
+  fi
+
+  case "$MODE" in
+    rollback|listbackups)
+      # baste amade shod (chون update.sh-e mahalli naboud); hala action ra ejra kon
+      exec_update_action "$INSTALL_DIR/update.sh" ;;
+    uninstall)
+      run_uninstall "$INSTALL_DIR" ;;
+    update)
+      # update kamel: update.sh khodesh panel/node/hub ra tashkhis mide va hameye ejza ra berooz mikonad
+      log "ejra-ye update kamel ba snapshot + rollback-e khodkar..."
+      exec bash "$INSTALL_DIR/update.sh" "${PASS_ARGS[@]}" ;;
+    panel)
+      log "ejra-ye nasab panel (agar argument ndhi, khodesh bhsvrt taamoli miporsad)..."
+      exec bash "$INSTALL_DIR/install-panel.sh" "${PASS_ARGS[@]}" ;;
+
+    node)
+      # agar argument node dade nashode va taamoli hstim, bprs
+      if [ "${#PASS_ARGS[@]}" -eq 0 ] && is_tty; then prompt_node_args; fi
+      [ "${#PASS_ARGS[@]}" -gt 0 ] || die "etelaat node lazem ast (--server --name --token --inbound-port)."
+      log "ejra-ye nasab node..."
+      exec bash "$INSTALL_DIR/install-node.sh" "${PASS_ARGS[@]}" ;;
+  esac
+}
+
+if [ "${BOOTSTRAP_LIB_ONLY:-0}" != "1" ]; then
+  main
+fi

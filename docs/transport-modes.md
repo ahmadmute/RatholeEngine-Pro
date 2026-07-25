@@ -1,0 +1,84 @@
+# حالت‌های Transport — یک تونل، چند حامل
+
+همان تونل معکوس می‌تواند ترافیک را از **چهار مسیر** حمل کند (به‌علاوه‌ی حالت ویژه‌ی game/SNI). سوییچ بین حالت‌ها **هیچ‌وقت** سرویس‌ها، توکن‌ها یا مسیر (path) کاربران را عوض نمی‌کند — فقط *حاملِ* تونل تغییر می‌کند.
+
+![حالت‌های transport](assets/transport-modes.svg)
+
+> **اصل ثابت (invariant):** TLS فقط توسط nginx خاتمه می‌یابد؛ transport سمت rathole-server همیشه `tls = false` است. کلاینت پیش‌فرض با `tls = true` روی websocket به nginx/۴۴۳ وصل می‌شود.
+
+## ۱) websocket + TLS (پیش‌فرض)
+- کلاینت به `wss://domain:443` وصل می‌شود.
+- nginx ریشه‌ی `/` را با `$http_upgrade` بین **سایت فیک** و **کانال کنترلی rathole** تقسیم می‌کند (rathole همیشه از `/` برای کنترل استفاده می‌کند؛ path در rathole قابل‌تنظیم نیست).
+- TLS روی nginx خاتمه می‌یابد (گواهی Let's Encrypt).
+
+## ۲) kcp (UDP+FEC)
+- مسیر **موازی** UDP+FEC از طریق kcptun برای لینک‌های پرافت (mitigation برای TCP-over-TCP).
+- **افزودنی است** — به server/nginx/۴۴۳ دست نمی‌زند؛ یک مسیر ورودی دوم اضافه می‌کند.
+- پروفایل‌ها (`balanced`/`lossy`/`aggressive`) باید دو طرف یکی باشند (در `common.sh:kcp_profile`).
+- چند-ایران: هر upstream kcp مستقل دارد (`rathole-kcp-up-<id>`، پورت لوکال از ۲۹۹۰۱).
+- استتار: UDP/۴۴۳ برای DPI شبیه QUIC/HTTP3 دیده می‌شود و با nginx روی TCP/۴۴۳ تداخل ندارد.
+- روشن‌کردن: `ratholectl kcp on [port] [profile]` (ایران) و `ratholenode kcp on <ip:port> <key> [profile]` (نود).
+
+## ۳) plain (بدون TLS)
+- websocket بدون TLS به یک listener جداگانه‌ی HTTP (پیش‌فرض ۸۸۸۰).
+- سبک‌تر، ولی مسیر تونل بدون رمز nginx است.
+- روشن‌کردن: `ratholectl plain on [port]` و `ratholenode plain on <ip:port>`.
+
+## ۴) noise (رمزنگاری‌شده، بدون TLS/گواهی)
+- یک **اینستنس دوم rathole** (`rathole-noise`) روی یک پورت TCP عمومی (پیش‌فرض ۲۳۳۴).
+- transport از نوع Noise (X25519)؛ کلید خصوصی روی ایران می‌ماند، کلید عمومی منتشر می‌شود.
+- سرویس نودهای noise از `server.toml` به `noise-server.toml` جابه‌جا می‌شود.
+- روشن‌کردن: `ratholectl noise on [port]` سپس `ratholectl noise node <name> on`؛ نود: `ratholenode noise on <ip:port> <pubkey> [pattern]`.
+
+## ۵) game / SNI (لایه ۴ passthrough)
+- وقتی هر نودی `sni` داشته باشد، پورت ۴۴۳ به حالت **stream/SNI** در nginx (passthrough لایه ۴) می‌رود و vhost لایه ۷ (path/WS) به یک پورت داخلی (`internal_port`، پیش‌فرض ۸۴۴۳) منتقل می‌شود.
+- TLSِ ترافیک game روی **نود** خاتمه می‌یابد (گواهی واقعی، VLESS+TLS+Vision) — ایران فقط بایت‌ها را رد می‌کند.
+- روشن‌کردن: `ratholectl game add <name> <node_tls_inbound_port> <sni>`.
+
+---
+
+## ۶) direct-IP (masiryabi ba header — ورودیِ کاربری، نه حاملِ تونل)
+
+> این یک **حالتِ ورودی (ingress)** است، نه یک حاملِ transport مثل چهارتای بالا. مسیر تونل عوض نمی‌شود؛ فقط یک **درگاهِ ورودیِ دیگر** برای کاربر باز می‌شود که به‌جای path، از یک **هدرِ استتارشده** برای انتخاب نود استفاده می‌کند.
+
+- یک **پورت HTTP سادهٔ جداگانه** (پیش‌فرض ۸۰۸۱) که کاربر **مستقیم به IP سرور ایران** وصل می‌شود — نه دامنه، نه TLSِ nginx.
+- تصمیمِ مسیریابی از یک **هدرِ استتارشده** (پیش‌فرض `X-Cdn-Id`) می‌آید که مقدارش = **نام نود** است. `Host` فقط یک **decoy** (مثلاً `myket.ir`) است و در مسیریابی نقشی ندارد.
+- nginx با دو `map` (هدر → پورتِ لوکالِ rathole، سپس پورت-یا-fallback → backend) و یک `proxy_pass` مقصد را تعیین می‌کند. درخواست **بدون** هدرِ شناخته‌شده به **سایتِ فیک** می‌افتد (روی این پورت هیچ path-routing نیست).
+- **تفاوت با حالت plain (بند ۳):** `plain` یک تعویضِ *حاملِ تونل* بین نود↔ایران است؛ ولی direct-IP یک *ورودیِ کاربری* است که انتخابِ نود را در یک هدر پنهان می‌کند تا دسترسی از راهِ IP خام (سبکِ domain-fronting) بهتر استتار شود. با path-routing معمولِ ۴۴۳ به‌صورت موازی هم‌زیستی دارد.
+- **اشتراکِ پورت با plain:** اگر `direct_port == plain_port` باشد، فقط **یک** server block روی آن پورت ساخته می‌شود؛ هدرِ شناخته‌شده برنده است و هدرِ خالی/ناشناس به path-routing (`$backend_port`) می‌افتد.
+- **نودهای SNI مستثنا هستند** (روی ۴۴۳ passthroughِ لایه ۴ هستند و پورتِ لایه ۷ لوکال برای HTTP ساده ندارند).
+- روشن‌کردن: `ratholectl direct on [--port P] [--header H]`، و `off` / `status` / `show [name]`.
+
+**⚠ امنیت (باید به اپراتور گفته شود):** این listener **بدون TLS، بدون احراز هویت و عمومی** است. محرمانگی و احراز هویت **در لایهٔ پروکسیِ داخلِ تونل** (VLESS/VMess UUID و…) انجام می‌شود، نه این لایه. هدر یک **راهنمای مسیریابی + استتار** است، **نه یک اعتبارنامهٔ محرمانه** — هرکس نامِ یک نود را بداند به inboundِ آن نود می‌رسد (که خودش احراز هویت خودش را اعمال می‌کند). نامِ هدر و نامِ نودها پیش از رسیدن به `map` به‌شدت اعتبارسنجی می‌شوند، پس هیچ ورودیِ اپراتور بدون escape داخل کانفیگ درج نمی‌شود. باز کردن `direct_port` روی اینترفیسِ عمومی یک تغییرِ فایروال است که صریحاً به اپراتور اطلاع داده می‌شود (`warn` + تلاشِ best-effort برای `ufw allow`).
+
+---
+
+**نکته‌ی کلیدی:** در حالت‌های ۱ تا ۴، سرویس‌ها/توکن‌ها/مسیر کاربران دست‌نخورده می‌مانند؛ فقط حاملِ تونل عوض می‌شود. برای جزئیات مسیر بسته لایه‌به‌لایه: [`traffic-flow.md`](traffic-flow.md).
+
+---
+
+## ۷) adaptive failover (v1.5.0+)
+
+> یک لایه‌ی **خودکار** بالای حالت‌های ۱–۴. حاملِ فعال را بدون دخالت اپراتور عوض می‌کند.
+
+- **probe‌های bounded:** هر بازه (پیش‌فرض ۳۰ ثانیه) یک WebSocket RFC 6455 به `WS_PATH` می‌فرستد؛ طبقه‌بندی مستقیم:
+  `dns_failed` → `tcp_timeout` → `tls_failed` → `ws_rejected` → `ws_timeout` → `healthy`
+- **threshold/hysteresis:** پس از `ADAPTIVE_FAILURES` (پیش‌فرض ۳) شکست متوالی سوییچ؛ پس از `ADAPTIVE_RECOVERIES` (پیش‌فرض ۵) بازگشت سالم + اتمام cooldown.
+- **cooldown:** `ADAPTIVE_COOLDOWN` (پیش‌فرض ۳۰۰ ثانیه) بین سوییچ‌های متوالی.
+- **حامل‌های اولویت‌دار:** `ws` → `kcp` (و در صورت `ALLOW_INSECURE=1`: `plain`). plain هرگز بدون اجازه‌ی صریح انتخاب نمی‌شود.
+- **rollback خودکار:** اگر probe پس از سوییچ هم fail باشد، config قبلی بازیابی می‌شود.
+- **state sanitize:** `/etc/rathole/adaptive-state.json` (mode 0600) فقط فیلدهای `time`, `current`, `classification`, `latency_ms`, `consecutive_failures` دارد — هیچ token/key/WS_PATH در JSON نیست.
+- روشن‌کردن: `ratholenode adaptive on [--interval N] [--failures N] [--recoveries N]`، خاموش: `off`، وضعیت: `status`، تست: `test [--json]`.
+
+## ۸) secret WebSocket control path (v1.5.0+)
+
+> مسیر WebSocket کنترلی rathole از `/` به `/_rh/<32 hex>` منتقل شد تا DPI نتواند آن را از سایت فیک تشخیص دهد.
+
+- **nginx:** فقط `location = /_rh/<secret>` از `$http_upgrade` به control port می‌رود؛ همه‌ی مسیرهای دیگر رفتار fake/data خود را حفظ می‌کنند.
+- **مدیریت:** `ratholectl control-path show` نشان‌دهنده، `rotate` مسیر جدید می‌سازد و grace period برای به‌روزرسانی نودها فراهم می‌کند.
+- **نود:** `WS_PATH` در `node.env` ذخیره می‌شود و در `client.toml` به‌عنوان `path = "/_rh/..."` درج می‌شود (patch‌ی از core روی `WebsocketConfig.path`).
+- **نمایش:** `cmd_show` مقدار `WS_PATH=<masked>` چاپ می‌کند — هیچ secret کامل در لاگ پدیدار نمی‌شود.
+
+---
+
+**نکته‌ی کلیدی:** در حالت‌های ۱ تا ۴، سرویس‌ها/توکن‌ها/مسیر کاربران دست‌نخورده می‌مانند؛ فقط حاملِ تونل عوض می‌شود. برای جزئیات مسیر بسته لایه‌به‌لایه: [`traffic-flow.md`](traffic-flow.md).
